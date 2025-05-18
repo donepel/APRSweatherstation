@@ -1,322 +1,206 @@
 /************************************************************
-*****                  APRSwaterstation                  ****                        
-*****                 by Don_Epel                        ****
+*****               APRSweatherstation                  ****                        
+*****                 by Don_Epel                       ****
 *************************************************************/
 
-/********************************
-// ==== CHANGELOG ==== //
-Version 0.1
-  *Wifi 
-  *DHT11
-  *NTP
-  Esta version envia los parametros solo internet 
-
-
-
-*/
-
-/* ***************************************************/
 #include <ESP8266WiFi.h>
-#include <DHT.h>
 #include <WiFiUdp.h>
 #include <NTPClient.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <Ticker.h>
+#include <SPI.h>
+#include <SD.h>
 
-// ===== DEFINICIONES ===== //
-// WiFi
-const char* ssid = "nombredelawifi";
-const char* password = "clave";
+// =============== CHANGELOG ==============//
+/*
+ * version 0.2 - 18/05/2025
+ * se cambia modulo de temperatura y humedad dht11 por uno mas preciso AHT10
+ * Se agrega modulo de memoria SD para cache cuando no hay internet, al regresar se envia toda la informacion
+ * Se agraga led destellante de estado
+ * Se agrega watchdot por software ( no es lo mejor, pero es una mejora) 
+ */
 
-// APRS-IS
-const char* aprsServer = "rotate.aprs2.net"; // Servidor más confiable
-const int aprsPort = 14580; //puerto, no cambiar
-String callsign = "callsing-13"; //su señal distintiva, use con responsabilidad
-String passcode = "12322"; //clave aprs, lo obtienes de https://apps.magicbug.co.uk/passcode/
+// ================= CONFIGURACIÓN DE PINES ================= //
+/*
+ * CONEXIONES:
+ * 
+ * MÓDULO SD:
+ *   CS   → D8 (GPIO15)
+ *   MOSI → D7 (GPIO13)
+ *   MISO → D6 (GPIO12)
+ *   SCK  → D5 (GPIO14)
+ *   VCC  → 5V (Vin/VU) *Si el módulo tiene regulador LM1117*
+ *   GND  → GND
+ * 
+ * SENSOR AHT10:
+ *   VCC  → 3.3V
+ *   GND  → GND
+ *   SDA  → D2 (GPIO4)
+ *   SCL  → D1 (GPIO5)
+ * 
+ * LED:
+ *   LED_BUILTIN → D4 (GPIO2)
+ */
+// ================= CONFIGURACIÓN EDITABLE ================= //
 
+// ----- CONEXIONES WIFI ----- //
+const char* ssid = "wifi";       // Nombre de red WiFi
+const char* password = "pass";         // Contraseña WiFi
 
-#define TX_DELAY 500
+// ----- CREDENCIALES APRS ----- //
+const char* aprsServer = "rotate.aprs2.net";  // Servidor APRS
+const int aprsPort = 14580;                   // Puerto estándar
+String callsign = "distintica-13";                // Indicativo APRS
+String passcode = "clave";                    // Clave APRS
 
-// Sensor DHT11
-#define DHTPIN D2
-#define DHTYPE DHT11
-DHT dht(DHTPIN, DHTYPE);
+// ----- UBICACIÓN GEOGRÁFICA ----- //
+const float manualLat = -11.1111;  // Latitud (Sur negativo)
+const float manualLon = -11.1111;  // Longitud (Oeste negativo)
 
-// Posición fija
-float manualLat = -11.1111;
-float manualLon = -11.1111;
+// ----- HARDWARE ----- //
+#define SD_CS    D8  // Pin ChipSelect para módulo MicroSD (GPIO15)
+#define LED_PIN  D4  // Pin del LED interno (GPIO2)
 
-// NTP
+// ----- INTERVALOS ----- //
+const unsigned long TX_INTERVAL = 300000;  // 5 minutos entre transmisiones
+const unsigned long WIFI_CHECK = 30000;    // 30 segundos entre chequeos WiFi
+const unsigned long WDT_TIMEOUT = 60;      // Timeout del watchdog (segundos)
+
+// ================= NO MODIFICAR ================= //
 WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "ar.pool.ntp.org", -3 * 3600); // UTC-3 con servidor local
+NTPClient timeClient(ntpUDP, "ar.pool.ntp.org", -3 * 3600);
+Ticker watchdog;
+Adafruit_AHTX0 aht;
 
-// Variables de tiempo
-unsigned long lastPosTime = 0;
+unsigned long lastTxTime = 0;
 unsigned long lastWiFiCheck = 0;
-String lastValidTime = "0000z";
+bool sdReady = false;
+bool ahtReady = false;
 
+// ================= FUNCIONES ================= //
 
-
-
-
-// ===== FUNCIONES PRINCIPALES ===== //
-
-void connectToWiFi() {
-  WiFi.begin(ssid, password);
-  Serial.print("[WiFi] Conectando...");
-  
-  int timeout = 0;
-  while (WiFi.status() != WL_CONNECTED && timeout < 20) {
-    delay(500);
-    Serial.print(".");
-    timeout++;
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n[WiFi] Conectado a: " + String(ssid));
-    Serial.println("[WiFi] IP: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("\n[ERROR] WiFi no conectado. Modo offline.");
-  }
+void initWatchdog() {
+  watchdog.attach(WDT_TIMEOUT, []() { ESP.restart(); });
 }
 
-void checkWiFiConnection() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] Reconectando...");
-    WiFi.disconnect();
-    WiFi.begin(ssid, password);
-    
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
-      delay(500);
-      Serial.print(".");
-      attempts++;
-    }
-    
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\n[WiFi] Reconexión exitosa");
-      timeClient.forceUpdate(); // Resincronizar hora
-    }
+bool initSD() {
+  SPI.begin();
+  if(!SD.begin(SD_CS)) {
+    Serial.println("[SD] Error de inicialización");
+    return false;
   }
+  return true;
 }
 
-
-void setupNTP() {
-  Serial.println("[NTP] Iniciando cliente NTP...");
-  timeClient.begin();
-  timeClient.setTimeOffset(0); // UTC
-  timeClient.setPoolServerName("pool.ntp.org");
-
-  if (WiFi.status() == WL_CONNECTED) {
-    for (int i = 0; i < 3; i++) {
-      if (timeClient.update()) {
-        Serial.println("[NTP] Sincronización exitosa.");
-        return;
-      }
-      delay(500);
-    }
-    Serial.println("[NTP] Falló la sincronización NTP.");
-  } else {
-    Serial.println("[NTP] WiFi no conectado, no se puede iniciar NTP.");
+bool initAHT() {
+  Wire.begin();
+  if(!aht.begin()) {
+    Serial.println("[AHT] Sensor no detectado");
+    return false;
   }
+  return true;
 }
 
-
-String getAPRSTimestamp() {
-  static unsigned long lastUpdate = 0;
-  
-  // Cache de 1 minuto para evitar consultas frecuentes
-  if (millis() - lastUpdate < 60000 && lastValidTime != "000000z") {
-    return lastValidTime;
+String getTimestamp() {
+  if(timeClient.update()) {
+    String time = timeClient.getFormattedTime();
+    return time.substring(0,2) + time.substring(3,5) + time.substring(6,8) + "z";
   }
-
-  // Intenta obtener hora NTP
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("\nIntenta obtener hora NTP");
-    for (int i = 0; i < 3; i++) { // 3 intentos
-      if (timeClient.update()) {
-        String timeStr = timeClient.getFormattedTime();
-        lastValidTime = timeStr.substring(0,2) + timeStr.substring(3,5) + timeStr.substring(6, 8) + "z";
-        lastUpdate = millis();
-        Serial.println("[NTP] Hora actual: " + timeStr + " -> " + lastValidTime);
-        Serial.println("\nHora: " + timeStr);
-
-        return lastValidTime;
-      }
-      delay(500);
-    }
-  }
-  
-  // Fallback: hora aproximada basada en millis()
-  Serial.println("\n[NTP] Usando hora local aproximada");
-  unsigned long secs = millis() / 1000;
-  int hh = (secs / 3600) % 24;
-  int mm = (secs / 60) % 60;
-  char buffer[6];
-  snprintf(buffer, sizeof(buffer), "%02d%02dz", hh, mm);
-  //Serial.print("\nHora local:);
-  Serial.println("\nHoralocal: " + String(hh) + ":" + String(mm));
-
-  return String(buffer);
+  return "000000z";
 }
 
 String convertToAPRSCoord(float value, bool isLat) {
   char buffer[10];
   int degrees = int(abs(value));
   float minutes = (abs(value) - degrees) * 60;
-  
-  // Formato exacto requerido por APRS
-  snprintf(buffer, sizeof(buffer), 
-          isLat ? "%02d%05.2f" : "%03d%05.2f", 
-          degrees, minutes);
-  
+  snprintf(buffer, sizeof(buffer), isLat ? "%02d%05.2f" : "%03d%05.2f", degrees, minutes);
   return String(buffer) + (isLat ? (value >= 0 ? "N" : "S") : (value >= 0 ? "E" : "W"));
 }
-// ==== APRS  GPS Y EStaCIoN==== //
-void sendAPRSPacket() {
-  String timestamp = getAPRSTimestamp();
-  String  posPacket = callsign + ">APE32I,WIDE1-1,TCPIP,qAR," + callsign + ":";
-          posPacket += "!"; 
-          posPacket += convertToAPRSCoord(manualLat, true) + "/" + convertToAPRSCoord(manualLon, false);
-          posPacket += timestamp;
-          posPacket += "["; //icono de persona
-          posPacket += "PHG2010"; //datos de la estacion como potencia y antena
-          posPacket += "_000/000g000t072r000p000h50b10215"; // Datos meteorológicos de prueba
-          posPacket += "/Estacion experimental movil, en pruebas";
-  sendPacket(posPacket);
-}
 
-// ==== APRS  Clima ==== //
-void sendAPRSWX() {
-  String timestamp = getAPRSTimestamp();  // "hhmmssz"
-  
-   float tempC = dht.readTemperature();
-  float humidity = dht.readHumidity();
-  
-  if(isnan(tempC)) tempC = 0;
-  if(isnan(humidity)) humidity = 0;
+String buildPacket(float temp, float hum) {
+  int tempF = round(temp * 1.8 + 32);
+  tempF = constrain(tempF, -99, 999);
+  int humRounded = constrain(round(hum), 0, 100);
 
-  // Conversión y redondeo
-  int tempF = round(tempC * 1.8 + 32);
-  int hum = round(humidity);
+  String packet = callsign + ">APE32I,WIDE1-1,TCPIP,qAR," + callsign + ":";
+  packet += "@" + getTimestamp();
+  packet += convertToAPRSCoord(manualLat, true) + "/";
+  packet += convertToAPRSCoord(manualLon, false);
+  packet += "_000/000g000t";
   
-  String WXPacket = callsign + ">APE32I,WIDE1-1,TCPIP,qAR," + callsign + ":";
+  if(tempF < 100) packet += "0";
+  if(tempF < 10) packet += "0";
+  packet += String(tempF);
+  
+  packet += "r000p000P000h";
+  if(humRounded < 10) packet += "0";
+  packet += String(humRounded);
+  packet += "b00000WX-distintiva-13";
 
-  WXPacket += "@" + timestamp ;
-  WXPacket += convertToAPRSCoord(manualLat, true) + "/";
-  WXPacket += convertToAPRSCoord(manualLon, false);
-  
-  //Datos metereologicos
-  WXPacket += "_";  // Indicador de bloque de datos meteorológicos
-  WXPacket += "000/000";  // direccion/velocidad
-  WXPacket += "g000";  // rafaga maxima.
-  WXPacket += "t";         // Temperatura
-  if(tempF < 100) WXPacket += "0";  // Asegura 3 dígitos
-  WXPacket += String(tempF);
-  WXPacket += "r000p000P000"; // Lluvia
-  WXPacket += "h";
-  if(hum < 10) WXPacket += "0";  // Asegura 2 dígitos
-  WXPacket += String(hum);
-  WXPacket += "b00000";  // presion atmosferica
-  
-  // Comentario adicional (opcional)
-  WXPacket += "WX node Buenos Aires";
-
-  sendPacket(WXPacket);
-}
-
-void sendPacket(String packet) {
-  Serial.println("[ENVIO] " + packet);
-  
-  // Limpieza del paquete
-  packet.trim();
-  
-  // Envío por radio (opcional)
-  String radioPacket = packet;
-  radioPacket.replace(",TCPIP*", "");
-  // sendToRadio(radioPacket);
-  
-  // Envío por internet
-  sendToAPRSIS(packet);
+  Serial.printf("[WX] Temp: %.1fC (t%03dF) Hum: %d%%\n", temp, tempF, humRounded);
+  return packet;
 }
 
 void sendToAPRSIS(String packet) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[APRS-IS] WiFi no conectado");
-    return;
-  }
-
   WiFiClient client;
-  if (client.connect(aprsServer, aprsPort)) {
-    // Envía credenciales
-    client.print("user ");
-    client.print(callsign);
-    client.print(" pass ");
-    client.print(passcode);
-    client.print(" vers ESP8266-APRS 1.0");
-    client.print("\n");
-    
-    // Espera breve
+  if(client.connect(aprsServer, aprsPort)) {
+    client.print("user " + callsign + " pass " + passcode + " vers APRSWX-1.0\n");
     delay(100);
-    
-    // Envía el paquete
-    client.print(packet);
-    client.print("\n");
-    
-    // Cierra conexión
-    delay(50);
+    client.print(packet + "\n");
     client.stop();
-    Serial.println("[APRS-IS] Paquete enviado");
+    Serial.println("[APRS] Transmisión exitosa");
   } else {
-    Serial.println("[APRS-IS] Error de conexión");
+    Serial.println("[APRS] Error de conexión");
   }
 }
 
-
-
-// ===== SETUP ===== //
+// ================= SETUP ================= //
 void setup() {
   Serial.begin(115200);
-  while (!Serial); // Espera a que el monitor serial esté listo
-  
-  // Configuración hardware
-  pinMode(PTT_PIN, OUTPUT);
-  digitalWrite(PTT_PIN, HIGH);
-  pinMode(AUDIO_PIN, OUTPUT);
-  noTone(AUDIO_PIN);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
 
-  // Inicialización de componentes
-  dht.begin();
-  connectToWiFi();
-  setupNTP();
-
-  Serial.println("\n[INFO] Estación APRS iniciada (DHT11)");
-  // Test inicial del sensor DHT
-  Serial.println("[DHT] Probando sensor...");
-  float t = dht.readTemperature();
-  float h = dht.readHumidity();
+  initWatchdog();
   
-  if (isnan(t) || isnan(h)) {
-    Serial.println("[ERROR] No se pudo leer el sensor DHT!");
-  } else {
-    Serial.printf("[DHT] Lectura inicial: %.1f°C, %.1f%% HR\n", t, h);
+  Serial.println("\nIniciando APRSweatherstation");
+  Serial.println("Inicializando hardware...");
+
+  sdReady = initSD();
+  ahtReady = initAHT();
+
+  WiFi.begin(ssid, password);
+  while(WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
   }
+  Serial.println("\n[WiFi] Conectado");
 
+  timeClient.begin();
+  timeClient.update();
+
+  Serial.println("Sistema listo");
+  digitalWrite(LED_PIN, LOW);
 }
 
-// ===== LOOP PRINCIPAL ===== //
+// ================= LOOP ================= //
 void loop() {
-  // Verifica conexión WiFi periódicamente
-  if (millis() - lastWiFiCheck > 30000) 
-  {
-    checkWiFiConnection();
+  digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+
+  if(millis() - lastWiFiCheck > WIFI_CHECK) {
+    if(WiFi.status() != WL_CONNECTED) WiFi.reconnect();
     lastWiFiCheck = millis();
   }
-  
-  // Envía paquete APRS cada 60 segundos
-  if (millis() - lastPosTime > 60000) {
-    sendAPRSWX(); //Datos de clima
-    lastPosTime = millis();
+
+  if(millis() - lastTxTime > TX_INTERVAL) {
+    if(ahtReady) {
+      sensors_event_t humidity, temp;
+      if(aht.getEvent(&humidity, &temp)) {
+        sendToAPRSIS(buildPacket(temp.temperature, humidity.relative_humidity));
+      }
+    }
+    lastTxTime = millis();
   }
-  
 
   delay(1000);
-}
+}s
